@@ -295,7 +295,7 @@ async fn send_llsd(req: reqwest::RequestBuilder, kind: HttpKind) -> Result<Llsd,
         Ok(resp) => resp,
         Err(e) => {
             finish(timed, 0, 0, false);
-            return Err(CapsError::Http(e.to_string()));
+            return Err(CapsError::Http(e.without_url().to_string()));
         }
     };
     let status = resp.status();
@@ -307,7 +307,7 @@ async fn send_llsd(req: reqwest::RequestBuilder, kind: HttpKind) -> Result<Llsd,
         Ok(bytes) => bytes,
         Err(e) => {
             finish(timed, 0, 0, false);
-            return Err(CapsError::Http(e.to_string()));
+            return Err(CapsError::Http(e.without_url().to_string()));
         }
     };
     finish(timed, status.as_u16(), bytes.len(), true);
@@ -615,6 +615,48 @@ mod tests {
 
     const HELD: Duration = Duration::from_secs(30);
     const FAST: Duration = Duration::from_millis(200);
+
+    #[tokio::test]
+    async fn transport_errors_hide_secret_capability_urls() {
+        let _listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("local simulator");
+        let url = format!(
+            "http://{}/session/capability-secret?token=query-secret",
+            _listener.local_addr().expect("local address")
+        );
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("HTTP client");
+        let error = get_llsd(&http, &url).await.expect_err("the simulator does not answer");
+        let text = error.to_string();
+        assert!(!text.contains("capability-secret"), "capability path leaked: {text}");
+        assert!(!text.contains("query-secret"), "capability query leaked: {text}");
+    }
+
+    #[tokio::test]
+    async fn body_read_errors_hide_secret_capability_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("local simulator");
+        let url = format!(
+            "http://{}/session/capability-secret?token=query-secret",
+            listener.local_addr().expect("local address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("capability request");
+            let mut request = [0; 2048];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort")
+                .await
+                .expect("truncated reply");
+        });
+        let http = reqwest::Client::builder().no_proxy().build().expect("HTTP client");
+        let error = get_llsd(&http, &url).await.expect_err("the reply is truncated");
+        let text = error.to_string();
+        assert!(!text.contains("capability-secret"), "capability path leaked: {text}");
+        assert!(!text.contains("query-secret"), "capability query leaked: {text}");
+        server.await.expect("local simulator");
+    }
 
     #[test]
     fn a_quiet_place_never_stops_the_event_queue() {
