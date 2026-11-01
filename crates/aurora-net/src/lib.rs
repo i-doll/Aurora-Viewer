@@ -113,8 +113,8 @@ pub enum NetError {
 }
 
 /// The certificates a simulator's capability may be signed by: the public
-/// roots and Linden Lab's own CA (the simulator hostname is not checked, see
-/// NetClient::new).
+/// roots and Linden Lab's own CA. Clients using these roots verify both the
+/// certificate chain and the requested hostname.
 pub(crate) fn simulator_roots() -> Vec<reqwest::Certificate> {
     let mut roots: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
@@ -122,6 +122,12 @@ pub(crate) fn simulator_roots() -> Vec<reqwest::Certificate> {
         .collect();
     roots.extend(reqwest::Certificate::from_pem_bundle(include_bytes!("../lindenlab.pem")).unwrap_or_default());
     roots
+}
+
+pub(crate) fn simulator_client(roots: Vec<reqwest::Certificate>) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(aurora_version::user_agent())
+        .tls_certs_only(roots)
 }
 
 /// How many asset downloads may be under way at once.
@@ -186,16 +192,12 @@ impl NetClient {
             .tls_certs_merge(ll_ca)
             .build()
             .map_err(|e| NetError::Http(e.to_string()))?;
-        // Capabilities / assets: like LL's llcorehttp (mVerifyHost = false) the
-        // certificate chain is verified (public roots + Linden Lab CA) but the
-        // simulator hostname is not.
+        // Capabilities / assets: verify the certificate chain and requested
+        // hostname against the public roots and Linden Lab's CA.
         let roots = simulator_roots();
-        let caps_http = reqwest::Client::builder()
-            .user_agent(aurora_version::user_agent())
+        let caps_http = simulator_client(roots.clone())
             .pool_max_idle_per_host(32)
             .connect_timeout(std::time::Duration::from_secs(15))
-            .tls_certs_only(roots.clone())
-            .tls_danger_accept_invalid_hostnames(true)
             .build()
             .map_err(|e| NetError::Http(e.to_string()))?;
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<NetCommand>();
@@ -218,14 +220,11 @@ impl NetClient {
             None => log::info!("asset fetch: adaptive (24 to {} requests at once)", fetch_pace::MAX),
             Some(n) => log::info!("asset fetch: limited to {n} requests at once, {idle_per_host} kept connections per host"),
         }
-        let asset_http = reqwest::Client::builder()
-            .user_agent(aurora_version::user_agent())
+        let asset_http = simulator_client(roots)
             .pool_max_idle_per_host(idle_per_host)
             .connect_timeout(std::time::Duration::from_secs(30))
             .gzip(false)
             .redirect(reqwest::redirect::Policy::limited(10))
-            .tls_certs_only(roots)
-            .tls_danger_accept_invalid_hostnames(true)
             .build()
             .map_err(|e| NetError::Http(e.to_string()))?;
         let (fetcher, fetch_results) = Fetcher::paced(rt.handle(), asset_http, fetch_slots, stats.clone());
@@ -362,5 +361,57 @@ mod asset_limit_tests {
         // the comparison override wins in both modes
         assert_eq!(asset_limits(AssetConnections::Adaptive, Some(64)), (Some(64), 64));
         assert_eq!(asset_limits(AssetConnections::Limited, Some(8)), (Some(8), 32));
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn https_server(subject_alt_name: &str) -> (String, reqwest::Certificate, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![subject_alt_name.to_owned()]).expect("test certificate");
+        let root = reqwest::Certificate::from_der(cert.der().as_ref()).expect("test root");
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .expect("TLS server");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("local simulator");
+        let url = format!("https://{}/", listener.local_addr().expect("local address"));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("TLS connection");
+            let Ok(mut socket) = acceptor.accept(socket).await else {
+                return;
+            };
+            let mut request = [0; 2048];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+        (url, root, server)
+    }
+
+    #[tokio::test]
+    async fn simulator_tls_rejects_a_certificate_for_another_hostname() {
+        let (url, root, server) = https_server("unrelated.example").await;
+        let http = simulator_client(vec![root]).no_proxy().build().expect("HTTP client");
+        let result = http.get(url).send().await;
+        assert!(result.is_err(), "a chain-valid certificate for another host was accepted");
+        server.await.expect("local simulator");
+    }
+
+    #[tokio::test]
+    async fn simulator_tls_accepts_a_trusted_certificate_for_the_requested_hostname() {
+        let (url, root, server) = https_server("127.0.0.1").await;
+        let http = simulator_client(vec![root]).no_proxy().build().expect("HTTP client");
+        let response = http.get(url).send().await.expect("matching certificate");
+        assert!(response.status().is_success());
+        server.await.expect("local simulator");
     }
 }

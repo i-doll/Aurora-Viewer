@@ -336,20 +336,11 @@ fn http() -> Result<&'static reqwest::Client, String> {
     static HTTP: OnceLock<Result<reqwest::Client, ()>> = OnceLock::new();
     let http = HTTP
         .get_or_init(|| {
-            // Same simulator trust as NetClient::new / Firestorm llcorehttp:
-            // Linden's CA is required, and simulator certificates need not
-            // match the individual simhost name. Keep certificate-chain
-            // verification and forbid redirects carrying the bridge token.
-            let mut roots: Vec<_> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-                .iter()
-                .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok())
-                .collect();
-            roots.extend(reqwest::Certificate::from_pem_bundle(include_bytes!("../lindenlab.pem")).map_err(|_| ())?);
-            reqwest::Client::builder()
-                .user_agent(aurora_version::user_agent())
+            // Same simulator trust as NetClient::new: Linden's CA is required.
+            // Keep certificate-chain and hostname verification, and forbid
+            // redirects carrying the bridge token.
+            crate::simulator_client(crate::simulator_roots())
                 .redirect(reqwest::redirect::Policy::none())
-                .tls_certs_only(roots)
-                .tls_danger_accept_invalid_hostnames(true)
                 .timeout(Duration::from_secs(8))
                 .build()
                 .map_err(|_| ())
